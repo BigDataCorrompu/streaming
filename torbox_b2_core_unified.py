@@ -19,9 +19,8 @@ from dotenv import load_dotenv
 # Charge les variables du fichier .env
 load_dotenv()
 
-# Récupère la valeur de la variable
+# Recupere la valeur de la variable
 torbox_api_key = os.getenv("TORBOX_API_KEY")
-
 
 TORBOX_API_KEY = torbox_api_key
 TORBOX_BASE = "https://api.torbox.app/v1/api"
@@ -40,7 +39,7 @@ def _endpoint_for(kind):
 
 
 def _remote_for(kind):
-    return "torbox" if kind == "torrent" else "torboxwebdl"
+    return "torbox"  # TorBox expose torrents ET webdl sur le meme WebDAV/remote rclone
 
 
 def add_download(source, kind, password=None):
