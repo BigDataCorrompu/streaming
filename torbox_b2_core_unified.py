@@ -188,23 +188,85 @@ def item_exists_on_b2(dest_path, new_name):
     return False
 
 
-def sync_and_rename(item_id, item_hash, kind, dest_path, new_name, label, max_retries=5):
+def sync_and_rename(item_id, item_hash, kind, dest_path, new_name, label, max_retries=5, password=None):
     """
     dest_path: ex "Series/House of the Dragon/Season 01" ou "Films"
     new_name: ex "HOTD S01E01" ou "El Retorno del Rey"
+    password: si les fichiers source sont des .rar/.zip proteges, extraction locale
     """
     source_folder = get_source_folder(item_id, item_hash, kind, label)
     remote = _remote_for(kind)
     tmp_folder = f"_tmp_{new_name.replace(' ', '_')}"
+    local_tmp = f"/tmp/extract_{new_name.replace(' ', '_')}"
 
     source_path = f"{remote}:{source_folder}/" if source_folder else f"{remote}:"
 
-    subprocess.run(
-        ["rclone", "copy", source_path, f"b2:{B2_BUCKET}/{dest_path}/{tmp_folder}/",
-         "--include", "*.mkv", "--include", "*.mp4", "--include", "*.srt", "--progress"],
-        check=False
-    )
+    # Regarde si la source contient des archives (rar/zip) plutot que du mkv/mp4 direct
+    result = subprocess.run(["rclone", "lsf", source_path], capture_output=True, text=True)
+    all_source_files = [f for f in result.stdout.strip().split("\n") if f]
+    has_archive = any(f.lower().endswith((".rar", ".zip")) for f in all_source_files)
+    has_video_direct = any(f.lower().endswith((".mkv", ".mp4")) for f in all_source_files)
 
+    if has_archive and not has_video_direct:
+        print(f"       [{label}] archive detectee, telechargement + extraction locale...")
+        subprocess.run(["mkdir", "-p", local_tmp], check=False)
+
+        # Telecharge l'archive brute (et le .srt s'il y en a) sur le VPS
+        # Inclut aussi les rar multi-parties: .r00/.r01 et .part1.rar/.part2.rar
+        subprocess.run(
+            ["rclone", "copy", source_path, local_tmp,
+             "--include", "*.rar", "--include", "*.r[0-9][0-9]",
+             "--include", "*.part[0-9]*.rar",
+             "--include", "*.zip", "--include", "*.srt", "--progress"],
+            check=False
+        )
+
+        # Extraction locale
+        # Pour les RAR multi-parties, on extrait uniquement depuis part1 (unrar suit le reste)
+        all_rars = [f for f in os.listdir(local_tmp) if f.lower().endswith(".rar")]
+        multi_part = [f for f in all_rars if ".part" in f.lower()]
+        if multi_part:
+            # ne garder que part1 comme point d'entree
+            archive_files = [f for f in multi_part if ".part1.rar" in f.lower() or ".part01.rar" in f.lower()]
+        else:
+            archive_files = all_rars + [f for f in os.listdir(local_tmp) if f.lower().endswith(".zip")]
+
+        for archive in archive_files:
+            archive_path = os.path.join(local_tmp, archive)
+            if archive.lower().endswith(".rar"):
+                cmd = ["unrar", "x", "-o+"]
+                if password:
+                    cmd.append(f"-p{password}")
+                else:
+                    cmd.append("-p-")  # pas de password, echoue proprement si protege
+                cmd += [archive_path, local_tmp + "/"]
+            else:
+                cmd = ["unzip", "-o"]
+                if password:
+                    cmd += ["-P", password]
+                cmd += [archive_path, "-d", local_tmp]
+
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"       [{label}] ECHEC extraction: {r.stderr[:300]}")
+
+        # Upload le contenu extrait (video + srt) vers B2 dans tmp_folder
+        subprocess.run(
+            ["rclone", "copy", local_tmp, f"b2:{B2_BUCKET}/{dest_path}/{tmp_folder}/",
+             "--include", "*.mkv", "--include", "*.mp4", "--include", "*.srt", "--progress"],
+            check=False
+        )
+        subprocess.run(["rm", "-rf", local_tmp], check=False)
+
+    else:
+        # Cas normal: copie directe torbox -> B2 (deja mkv/mp4)
+        subprocess.run(
+            ["rclone", "copy", source_path, f"b2:{B2_BUCKET}/{dest_path}/{tmp_folder}/",
+             "--include", "*.mkv", "--include", "*.mp4", "--include", "*.srt", "--progress"],
+            check=False
+        )
+
+    # Attend que le listing B2 confirme la presence d'un fichier video
     files = []
     for attempt in range(max_retries):
         result = subprocess.run(
@@ -275,7 +337,7 @@ def process_movie(link, movie_name, password=None, dest_path="Films"):
 
     item_id, item_hash = add_download(link, kind="webdl", password=password)
     wait_for_completion(item_id, item_hash, "webdl", label)
-    sync_and_rename(item_id, item_hash, "webdl", dest_path, movie_name, label)
+    sync_and_rename(item_id, item_hash, "webdl", dest_path, movie_name, label, password=password)
 
     if not item_exists_on_b2(dest_path, movie_name):
         print(f"      ECHEC: {movie_name} - video absente apres transfert")
